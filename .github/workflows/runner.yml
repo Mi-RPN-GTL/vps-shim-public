@@ -93,6 +93,21 @@ jobs:
         run: |
           sudo mkdir -p /root
           sudo ln -sfn "/home/runner/shim/repo/vps-shim" /root/miadol
+          # v32 fix: /root is drwx------ (root-only) on a stock Actions
+          # runner. The symlink above is created fine (via sudo), but
+          # every later step that reads/writes THROUGH /root/miadol --
+          # starting with prepare_venv.sh immediately below, which
+          # runs as the plain `runner` user, not root -- needs to be
+          # able to traverse /root itself first, symlink or not. Without
+          # this, `python3 -m venv "$VENV_DIR"` fails immediately with
+          # "Permission denied: '/root/miadol'" (confirmed in the pass
+          # 8 run logs). Grant just execute/traverse on /root, not
+          # ownership of anything inside it -- enough to walk through
+          # to /root/miadol/..., nothing more. This is fine on a
+          # disposable, single-purpose Actions runner VM that's
+          # destroyed every session; only the `runner` user (the one
+          # running this entire job) benefits from it.
+          sudo chmod o+x /root
 
       - name: Prepare Freqtrade venv
         run: |

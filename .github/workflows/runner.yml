@@ -1,0 +1,154 @@
+name: VPS-Shim Runner
+
+# ══════════════════════════════════════════════════════════════════
+# Pass 1 of 30 — the heartbeat only.
+#
+# What this proves, and nothing more:
+#   - a runner starts, runs for up to 5h50m, and stops itself cleanly
+#   - it then waits a real, guaranteed 10 minutes of true downtime
+#     (no app process, no runner, nothing billed as "up") before the
+#     next one is allowed to claim the session
+#   - it hands off to its own successor reliably, without depending
+#     on GitHub's `schedule:` cron trigger, which is explicitly
+#     documented as unreliable for anything time-sensitive (can be
+#     delayed 15-60+ minutes or skipped entirely under load) --
+#     see the pass 1 notes in SHIM_NOTES.md for the sources.
+#
+# What this deliberately does NOT do yet (later passes):
+#   - no real root/session directory conventions (pass 5)
+#   - no app code, no automate.py/wfo/meta_bot.py (pass 10+)
+#   - no primer/handoff, no Cloudflare (pass 11+)
+#
+# Pass 4 update: the placeholder idle loop is now replaced by a real
+# checkpoint-pull (once, at session start) + push-on-cadence sync
+# loop, using private-repo/vps-shim/scripts/git_pull.sh and
+# git_push.sh (pass 2/3). The sync loop owns its own budget exit and
+# performs the final checkpoint push itself, so the downtime-gap step
+# below runs immediately after it, unchanged from pass 1.
+#
+# HOW THE 10-MINUTE GAP IS ENFORCED (read this before changing the
+# timing numbers below):
+#   GitHub's `schedule:` (cron) trigger is NOT used for the restart,
+#   specifically because it is documented as unreliable for anything
+#   under ~15-60 minutes of precision. Instead, THIS runner's own
+#   last step sleeps for the gap itself, using real wall-clock time
+#   inside the job, then dispatches its successor via
+#   repository_dispatch. That successor cannot start any earlier
+#   than the sleep allows, because nothing dispatches it until the
+#   sleep finishes. This costs 10 minutes of this runner's own job
+#   time (billed the same as if it were doing work), in exchange for
+#   a real, verifiable gap instead of a best-effort cron guess.
+# ══════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-shim-runner]
+
+concurrency:
+  group: vps-shim-runner
+  cancel-in-progress: false
+
+env:
+  # 5h50m run budget, matching the proven pattern from the meta-site
+  # batch-template.yml (STOP_AFTER_SECONDS = 5*3600 + 50*60).
+  RUN_BUDGET_SECONDS: 21000
+  # The real, enforced downtime gap between one runner ending and the
+  # next one being dispatched. Not a suggestion -- see the sleep step
+  # below, this is the actual mechanism, not documentation of intent.
+  DOWNTIME_GAP_SECONDS: 600
+
+jobs:
+  session:
+    runs-on: ubuntu-latest
+    # Hard ceiling slightly above RUN_BUDGET_SECONDS (350 min = 21000s)
+    # so GitHub's own job timeout is never what ends the run -- the
+    # budget check inside the job always fires first, on our terms,
+    # leaving room to exit cleanly rather than being killed mid-write.
+    timeout-minutes: 355
+    steps:
+      - name: Record session start
+        id: start
+        run: |
+          START_EPOCH=$(date +%s)
+          echo "start_epoch=${START_EPOCH}" >> "$GITHUB_OUTPUT"
+          echo "Session started at $(date -u -d @${START_EPOCH} '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "Run budget: ${RUN_BUDGET_SECONDS}s (~$((RUN_BUDGET_SECONDS/3600))h$(( (RUN_BUDGET_SECONDS%3600)/60 ))m)"
+
+      - name: Checkpoint pull
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          curl -s -H "Authorization: token ${SHIM_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GH_OWNER}/${PRIVATE_REPO_NAME}/contents/vps-shim/scripts/git_pull.sh" \
+            | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d['content']).decode())" \
+            > /tmp/git_pull.sh
+          chmod +x /tmp/git_pull.sh
+          GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" SHIM_PAT="${SHIM_PAT}" bash /tmp/git_pull.sh
+
+      - name: Install frontend bot dependencies
+        run: |
+          pip install --quiet aiohttp
+
+      - name: Start Telegram frontend bot
+        env:
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+          SHIM_ROOT: /home/runner/shim
+        run: |
+          LOGS_DIR="/home/runner/shim/repo/vps-shim/logs" \
+          SHIM_ROOT="/home/runner/shim" \
+          SHIM_BOT_TOKEN="${SHIM_BOT_TOKEN}" \
+          SHIM_OWNER_CHAT_ID="${SHIM_OWNER_CHAT_ID}" \
+          nohup python3 /home/runner/shim/repo/vps-shim/telegram/frontend_bot.py \
+            > /home/runner/shim/repo/vps-shim/logs/combined.log 2>&1 &
+          echo "frontend bot launched, pid $!"
+
+      - name: Sync loop within budget
+        env:
+          START_EPOCH: ${{ steps.start.outputs.start_epoch }}
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          PUSH_INTERVAL=60
+          LAST_PUSH=0
+          SHIM_ROOT=/home/runner/shim
+          while true; do
+            NOW=$(date +%s)
+            ELAPSED=$((NOW - START_EPOCH))
+            REMAINING=$((RUN_BUDGET_SECONDS - ELAPSED))
+            if [ "$REMAINING" -le 30 ]; then
+              bash "$SHIM_ROOT/repo/vps-shim/scripts/git_push.sh" "checkpoint: session end"
+              break
+            fi
+            if [ $((NOW - LAST_PUSH)) -ge "$PUSH_INTERVAL" ]; then
+              bash "$SHIM_ROOT/repo/vps-shim/scripts/git_push.sh" "checkpoint: periodic" || true
+              LAST_PUSH=$NOW
+            fi
+            sleep 10
+          done
+
+      - name: Enforced downtime gap (real sleep, not cron)
+        if: always()
+        run: |
+          echo "Sleeping ${DOWNTIME_GAP_SECONDS}s before dispatching the successor."
+          echo "This is the actual downtime -- nothing runs during this window."
+          sleep "${DOWNTIME_GAP_SECONDS}"
+          echo "Downtime gap complete."
+
+      - name: Dispatch successor session
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Dispatching next session via repository_dispatch."
+          curl -s -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+            -d '{"event_type":"restart-shim-runner"}'
+          echo "Dispatched. This runner's job ends now."

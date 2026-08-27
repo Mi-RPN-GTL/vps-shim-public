@@ -89,20 +89,69 @@ jobs:
           chmod +x /tmp/git_pull.sh
           GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" SHIM_PAT="${SHIM_PAT}" bash /tmp/git_pull.sh
 
+      - name: Symlink /root/miadol to shim root
+        run: |
+          sudo mkdir -p /root
+          sudo ln -sfn "/home/runner/shim/repo/vps-shim" /root/miadol
+
+      - name: Prepare Freqtrade venv
+        run: |
+          bash /home/runner/shim/repo/vps-shim/scripts/prepare_venv.sh
+
       - name: Install frontend bot dependencies
         run: |
-          pip install --quiet aiohttp
+          pip install --quiet aiohttp requests
+
+      - name: Install cloudflared
+        run: |
+          curl -sL --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+          sudo dpkg -i /tmp/cloudflared.deb
+
+      - name: Install tmux
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq tmux
+
+      - name: Resume launched processes from prior session
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          SHIM_ROOT=/home/runner/shim
+          GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" SHIM_PAT="${SHIM_PAT}" python3 -c "
+          import os, sys
+          sys.path.insert(0, '$SHIM_ROOT/repo/vps-shim/telegram')
+          import launched
+          for rec in launched.resume_pending():
+              new_id, new_pid = launched.launch(rec['cmd'], rec['cwd'])
+              launched.mark_relaunched(rec['launch_id'], new_id)
+              print(f'resumed {rec[\"cmd\"]!r} as pid {new_pid}')
+              if rec.get('tunnel_local_port'):
+                  launched.attach_tunnel(
+                      new_id, rec['tunnel_local_port'],
+                      os.environ.get('GH_OWNER', ''),
+                      os.environ.get('PRIVATE_REPO_NAME', ''),
+                      os.environ.get('SHIM_PAT', ''),
+                  )
+                  print(f'  re-attached tunnel on port {rec[\"tunnel_local_port\"]}')
+          "
 
       - name: Start Telegram frontend bot
         env:
           SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
           SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
           SHIM_ROOT: /home/runner/shim
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
         run: |
           LOGS_DIR="/home/runner/shim/repo/vps-shim/logs" \
           SHIM_ROOT="/home/runner/shim" \
           SHIM_BOT_TOKEN="${SHIM_BOT_TOKEN}" \
           SHIM_OWNER_CHAT_ID="${SHIM_OWNER_CHAT_ID}" \
+          GH_OWNER="${GH_OWNER}" \
+          PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" \
+          SHIM_PAT="${SHIM_PAT}" \
           nohup python3 /home/runner/shim/repo/vps-shim/telegram/frontend_bot.py \
             > /home/runner/shim/repo/vps-shim/logs/combined.log 2>&1 &
           echo "frontend bot launched, pid $!"
@@ -121,7 +170,8 @@ jobs:
             NOW=$(date +%s)
             ELAPSED=$((NOW - START_EPOCH))
             REMAINING=$((RUN_BUDGET_SECONDS - ELAPSED))
-            if [ "$REMAINING" -le 30 ]; then
+            if [ "$REMAINING" -le 60 ]; then
+              python3 -c "import sys; sys.path.insert(0, '$SHIM_ROOT/repo/vps-shim/telegram'); import launched; launched.shutdown_all()"
               bash "$SHIM_ROOT/repo/vps-shim/scripts/git_push.sh" "checkpoint: session end"
               break
             fi

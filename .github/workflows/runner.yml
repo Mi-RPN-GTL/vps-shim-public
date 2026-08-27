@@ -132,8 +132,30 @@ jobs:
             sleep 10
           done
 
+      # v14 fix: these two steps used to be `if: always()`, on the theory
+      # that a successor should still be chained even if the sync loop
+      # failed for a non-cancellation reason (network blip, transient
+      # error, etc). But `always()` also fires when the JOB ITSELF was
+      # cancelled -- e.g. by shimdeploy.py's cancel_inflight_runs() during
+      # a redeploy -- and a cancelled run has no business chaining a
+      # successor at all, since shimdeploy.py's own step 6 (or the
+      # watchdog) already dispatches the next run. Without this guard you
+      # get two runners racing: the cancelled run's own tail *and* the
+      # fresh dispatch from shimdeploy.py, exactly as observed.
+      #
+      # GitHub's `cancelled()` status-check function is the correct tool
+      # here (not a per-step `steps.<id>.conclusion` check): it reflects
+      # whether this workflow run received a cancellation signal at all,
+      # regardless of which step was executing when SIGINT/SIGTERM hit.
+      # Docs: on cancellation, the runner sends SIGINT then SIGTERM to
+      # the active step, and the server re-evaluates `if` conditions for
+      # remaining steps -- `cancelled()` is exposed precisely so those
+      # remaining steps can detect this and opt out.
+      #
+      # Net effect: run on success OR ordinary (non-cancelled) failure,
+      # but never after cancellation. A cancelled session just dies.
       - name: Enforced downtime gap (real sleep, not cron)
-        if: always()
+        if: always() && !cancelled()
         run: |
           echo "Sleeping ${DOWNTIME_GAP_SECONDS}s before dispatching the successor."
           echo "This is the actual downtime -- nothing runs during this window."
@@ -141,7 +163,7 @@ jobs:
           echo "Downtime gap complete."
 
       - name: Dispatch successor session
-        if: always()
+        if: always() && !cancelled()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

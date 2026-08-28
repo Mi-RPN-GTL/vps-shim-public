@@ -189,7 +189,7 @@ jobs:
 
       - name: Install web UI dependencies
         run: |
-          pip install --quiet fastapi uvicorn
+          pip install --quiet fastapi uvicorn python-multipart
 
       - name: Start web UI server
         env:

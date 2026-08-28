@@ -1,101 +1,85 @@
 name: VPS-Shim Runner
 
 # ══════════════════════════════════════════════════════════════════
-# Pass 1 of 30 — the heartbeat only.
+# Warm-handoff model (this revision).
 #
-# What this proves, and nothing more:
-#   - a runner starts, runs for up to 5h50m, and stops itself cleanly
-#   - it then waits a real, guaranteed 10 minutes of true downtime
-#     (no app process, no runner, nothing billed as "up") before the
-#     next one is allowed to claim the session
-#   - it hands off to its own successor reliably, without depending
-#     on GitHub's `schedule:` cron trigger, which is explicitly
-#     documented as unreliable for anything time-sensitive (can be
-#     delayed 15-60+ minutes or skipped entirely under load) --
-#     see the pass 1 notes in SHIM_NOTES.md for the sources.
+# Two jobs, same workflow file, same concurrency group:
 #
-# What this deliberately does NOT do yet (later passes):
-#   - no real root/session directory conventions (pass 5)
-#   - no app code, no automate.py/wfo/meta_bot.py (pass 10+)
-#   - no primer/handoff, no Cloudflare (pass 11+)
+#   `session` -- the currently-active job. Runs setup, activates
+#   (bot/webui/tunnel + resumes prior launched processes), then runs
+#   the shared sync loop (vps-shim/scripts/sync_loop.sh). At T-20m
+#   remaining in its own budget, it dispatches a `standby` run via
+#   repository_dispatch (event: dispatch-standby-shim-runner). At its
+#   own budget end it shuts down, checkpoints, writes+pushes a
+#   go-file (vps-shim/state/go_standby.json), and exits. It no longer
+#   dispatches its successor directly -- that's `standby`'s job now,
+#   once `standby` sees the go-file.
 #
-# Pass 4 update: the placeholder idle loop is now replaced by a real
-# checkpoint-pull (once, at session start) + push-on-cadence sync
-# loop, using private-repo/vps-shim/scripts/git_pull.sh and
-# git_push.sh (pass 2/3). The sync loop owns its own budget exit and
-# performs the final checkpoint push itself, so the downtime-gap step
-# below runs immediately after it, unchanged from pass 1.
+#   `standby` -- dispatched ~20 minutes before the current session
+#   ends. Runs the SAME setup (setup_env.sh) ahead of time, on its
+#   own fresh runner VM, then polls for the go-file. The moment it
+#   sees one, it activates (same activate.sh session uses) and falls
+#   into the same sync_loop.sh -- becoming the new active session, in
+#   place, on the same job/run. It will itself dispatch the next
+#   standby at ITS OWN T-20m, via the same sync_loop.sh logic.
 #
-# HOW THE 10-MINUTE GAP IS ENFORCED (read this before changing the
-# timing numbers below):
-#   GitHub's `schedule:` (cron) trigger is NOT used for the restart,
-#   specifically because it is documented as unreliable for anything
-#   under ~15-60 minutes of precision. Instead, THIS runner's own
-#   last step sleeps for the gap itself, using real wall-clock time
-#   inside the job, then dispatches its successor via
-#   repository_dispatch. That successor cannot start any earlier
-#   than the sleep allows, because nothing dispatches it until the
-#   sleep finishes. This costs 10 minutes of this runner's own job
-#   time (billed the same as if it were doing work), in exchange for
-#   a real, verifiable gap instead of a best-effort cron guess.
+# This means there is close to zero cold gap between one session
+# ending and its successor being ready: standby's setup (venv, deps,
+# cloudflared install, etc) already happened during the outgoing
+# session's last 20 minutes, in parallel, on a separate VM. The only
+# serialized part is: outgoing session's own shutdown + checkpoint
+# push + go-file push, then standby's git pull of that checkpoint +
+# activation -- seconds, not the old 10-minute enforced cold gap.
+#
+# FALLBACK (no standby was ever dispatched -- session crashed/was
+# cancelled before reaching T-20m, or the dispatch call itself
+# failed): nothing here recovers that automatically. watchdog.yml
+# polls every 20 minutes; if it sees no completed runner.yml run
+# recently and nothing in_progress, it dispatches a fresh cold
+# `restart-shim-runner` session exactly as before. Worst case is a
+# gap bounded by the watchdog's own poll interval, not an indefinite
+# stall.
+#
+# Both jobs share the SAME concurrency group as before
+# (vps-shim-runner, cancel-in-progress: true) specifically so that
+# shimdeploy.py's redeploy path (disable workflow, then
+# cancel_inflight_runs() across the whole repo) still force-cancels
+# a `standby` run exactly like it does `session` -- a redeploy must
+# not leave a standby alive on stale code. cancel_inflight_runs()
+# cancels every active run repo-wide already (confirmed: it is not
+# scoped to a single workflow file), so no change was needed there.
+#
+# What did NOT change from the prior revision: RUN_BUDGET_SECONDS
+# (5h50m), the reason schedule: cron is not used for anything
+# timing-sensitive (see prior notes, still true), the mechanics of
+# git_pull.sh/git_push.sh, and cancel-in-progress's tradeoff
+# (a healthy mid-flight session gets cut off immediately by a manual
+# redeploy rather than finishing gracefully -- deliberately accepted,
+# see prior notes).
 # ══════════════════════════════════════════════════════════════════
 
 on:
   workflow_dispatch:
   repository_dispatch:
-    types: [restart-shim-runner]
+    types: [restart-shim-runner, dispatch-standby-shim-runner]
 
-# v53 fix: cancel-in-progress was false, meaning a new dispatch queued
-# BEHIND whatever already held this group instead of displacing it.
-# That's fine when the prior run is healthy and finishing normally --
-# but when it's a GitHub-side stuck/zombie run (public status "queued"
-# forever, cancel API refuses with 409 -- see shimdeploy_lib.py's
-# cancel_inflight_runs() v52 fix notes for the full story), a queued
-# successor could be left waiting indefinitely behind a run that will
-# never clear on its own.
-#
-# cancel-in-progress: true moves cancellation from "shimdeploy.py's
-# API call, which can be refused by GitHub" to "the Actions engine's
-# own concurrency-group enforcement, which is unconditional" -- when a
-# new run enters this group, GitHub force-cancels whatever's currently
-# holding it, no cooperation from the old run required. This is the
-# only lever available that isn't subject to the same 409 stuck-state
-# bug, since it's enforced at dispatch time by GitHub itself rather
-# than by a cancel request that has to succeed against the same broken
-# run.
-#
-# Tradeoff, deliberately accepted: this also now applies to a HEALTHY,
-# currently-executing session, not just zombies. Manually triggering a
-# new run (or shimdeploy.py redeploying) while a good session is mid-
-# flight will cut it off immediately, rather than letting it finish
-# its own graceful shutdown (git_push.sh checkpoint, launched.shutdown_all())
-# first. In exchange for that, a stuck run can never again block a
-# legitimate redeploy from starting. Given this project's own rationale
-# for redeploying at all -- "new code takes over now, not whenever the
-# old run cycles" (see shimdeploy.py's module docstring, step 3) -- an
-# abrupt cutover is already the intended behavior for the normal
-# redeploy path; this just makes that same cutover reliable in the
-# stuck-run case too, instead of silently hanging.
 concurrency:
   group: vps-shim-runner
   cancel-in-progress: true
 
 env:
-  # 5h50m run budget, matching the proven pattern from the meta-site
-  # batch-template.yml (STOP_AFTER_SECONDS = 5*3600 + 50*60).
   RUN_BUDGET_SECONDS: 21000
-  # The real, enforced downtime gap between one runner ending and the
-  # next one being dispatched. Not a suggestion -- see the sleep step
-  # below, this is the actual mechanism, not documentation of intent.
+  # Retained for the fallback/manual path only -- standby's normal
+  # dispatch has no fixed sleep gap (see header). Kept in case a
+  # manual workflow_dispatch of `session` is ever used without a
+  # standby cycle already primed (e.g. very first cold start).
   DOWNTIME_GAP_SECONDS: 600
+  STANDBY_DISPATCH_LEAD_SECONDS: 1200
 
 jobs:
   session:
+    if: github.event_name == 'workflow_dispatch' || github.event.action == 'restart-shim-runner'
     runs-on: ubuntu-latest
-    # Hard ceiling slightly above RUN_BUDGET_SECONDS (350 min = 21000s)
-    # so GitHub's own job timeout is never what ends the run -- the
-    # budget check inside the job always fires first, on our terms,
-    # leaving room to exit cleanly rather than being killed mid-write.
     timeout-minutes: 355
     steps:
       - name: Record session start
@@ -104,101 +88,25 @@ jobs:
           START_EPOCH=$(date +%s)
           echo "start_epoch=${START_EPOCH}" >> "$GITHUB_OUTPUT"
           echo "Session started at $(date -u -d @${START_EPOCH} '+%Y-%m-%d %H:%M:%S UTC')"
-          echo "Run budget: ${RUN_BUDGET_SECONDS}s (~$((RUN_BUDGET_SECONDS/3600))h$(( (RUN_BUDGET_SECONDS%3600)/60 ))m)"
 
-      - name: Checkpoint pull
+      - name: Setup environment
         env:
           GH_OWNER: ${{ github.repository_owner }}
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
         run: |
+          # setup_env.sh isn't on disk yet on a fresh runner -- bootstrap
+          # it the same way git_pull.sh used to be bootstrapped, then
+          # hand off to the checked-out copy for everything after.
           curl -s -H "Authorization: token ${SHIM_PAT}" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${GH_OWNER}/${PRIVATE_REPO_NAME}/contents/vps-shim/scripts/git_pull.sh" \
+            "https://api.github.com/repos/${GH_OWNER}/${PRIVATE_REPO_NAME}/contents/vps-shim/scripts/setup_env.sh" \
             | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d['content']).decode())" \
-            > /tmp/git_pull.sh
-          chmod +x /tmp/git_pull.sh
-          GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" SHIM_PAT="${SHIM_PAT}" bash /tmp/git_pull.sh
+            > /tmp/setup_env.sh
+          chmod +x /tmp/setup_env.sh
+          SHIM_ROOT=/home/runner/shim GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" SHIM_PAT="${SHIM_PAT}" bash /tmp/setup_env.sh
 
-      - name: Symlink /root/miadol to shim root
-        run: |
-          sudo mkdir -p /root
-          sudo ln -sfn "/home/runner/shim/repo/vps-shim" /root/miadol
-          # v32 fix: /root is drwx------ (root-only) on a stock Actions
-          # runner. The symlink above is created fine (via sudo), but
-          # every later step that reads/writes THROUGH /root/miadol --
-          # starting with prepare_venv.sh immediately below, which
-          # runs as the plain `runner` user, not root -- needs to be
-          # able to traverse /root itself first, symlink or not. Without
-          # this, `python3 -m venv "$VENV_DIR"` fails immediately with
-          # "Permission denied: '/root/miadol'" (confirmed in the pass
-          # 8 run logs). Grant just execute/traverse on /root, not
-          # ownership of anything inside it -- enough to walk through
-          # to /root/miadol/..., nothing more. This is fine on a
-          # disposable, single-purpose Actions runner VM that's
-          # destroyed every session; only the `runner` user (the one
-          # running this entire job) benefits from it.
-          sudo chmod o+x /root
-
-      - name: Prepare Freqtrade venv
-        run: |
-          bash /home/runner/shim/repo/vps-shim/scripts/prepare_venv.sh
-
-      - name: Install frontend bot dependencies
-        run: |
-          pip install --quiet aiohttp requests
-
-      - name: Install cloudflared
-        run: |
-          curl -sL --output /tmp/cloudflared.deb https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-          sudo dpkg -i /tmp/cloudflared.deb
-
-      - name: Install tmux
-        run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq tmux
-
-      - name: Put systemd-compat wrappers on PATH
-        run: |
-          # v33: meta_bot.py (hosted unmodified through the existing
-          # launch mechanism, exactly like any other launched process)
-          # calls real `systemctl restart <unit>` / `journalctl -u
-          # <unit> ...` -- neither binary exists on an Actions runner.
-          # telegram/launched.py's launch() never passes env= to
-          # Popen(), so a launched child inherits this job's PATH
-          # verbatim (confirmed by reading launch()'s Popen call
-          # directly, not assumed) -- prepending the wrapper dir here,
-          # before frontend_bot.py itself starts, is therefore
-          # sufficient for it to reach every process the shim launches,
-          # meta_bot.py included, with no per-launch special-casing.
-          echo "/home/runner/shim/repo/vps-shim/bin" >> "$GITHUB_PATH"
-          chmod +x /home/runner/shim/repo/vps-shim/bin/systemctl /home/runner/shim/repo/vps-shim/bin/journalctl
-
-      - name: Resume launched processes from prior session
-        env:
-          GH_OWNER: ${{ github.repository_owner }}
-          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
-          SHIM_PAT: ${{ secrets.SHIM_PAT }}
-        run: |
-          SHIM_ROOT=/home/runner/shim
-          GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" SHIM_PAT="${SHIM_PAT}" python3 -c "
-          import os, sys
-          sys.path.insert(0, '$SHIM_ROOT/repo/vps-shim/telegram')
-          import launched
-          for rec in launched.resume_pending():
-              new_id, new_pid = launched.launch(rec['cmd'], rec['cwd'])
-              launched.mark_relaunched(rec['launch_id'], new_id)
-              print(f'resumed {rec[\"cmd\"]!r} as pid {new_pid}')
-              if rec.get('tunnel_local_port'):
-                  launched.attach_tunnel(
-                      new_id, rec['tunnel_local_port'],
-                      os.environ.get('GH_OWNER', ''),
-                      os.environ.get('PRIVATE_REPO_NAME', ''),
-                      os.environ.get('SHIM_PAT', ''),
-                  )
-                  print(f'  re-attached tunnel on port {rec[\"tunnel_local_port\"]}')
-          "
-
-      - name: Start Telegram frontend bot
+      - name: Activate (launch bot/webui/tunnel, resume processes)
         env:
           SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
           SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
@@ -207,124 +115,110 @@ jobs:
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
           MIAPORTAL_BASE_URL: ${{ vars.MIAPORTAL_BASE_URL }}
-        run: |
-          LOGS_DIR="/home/runner/shim/repo/vps-shim/logs" \
-          SHIM_ROOT="/home/runner/shim" \
-          SHIM_BOT_TOKEN="${SHIM_BOT_TOKEN}" \
-          SHIM_OWNER_CHAT_ID="${SHIM_OWNER_CHAT_ID}" \
-          GH_OWNER="${GH_OWNER}" \
-          PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" \
-          SHIM_PAT="${SHIM_PAT}" \
-          MIAPORTAL_BASE_URL="${MIAPORTAL_BASE_URL}" \
-          nohup python3 /home/runner/shim/repo/vps-shim/telegram/frontend_bot.py \
-            > /home/runner/shim/repo/vps-shim/logs/combined.log 2>&1 &
-          echo "frontend bot launched, pid $!"
-
-      - name: Install web UI dependencies
-        run: |
-          pip install --quiet fastapi uvicorn python-multipart
-
-      - name: Start web UI server
-        env:
-          SHIM_ROOT: /home/runner/shim
           SHIM_WEBUI_SECRET: ${{ secrets.SHIM_WEBUI_SECRET }}
           SHIM_WEBUI_PASSPHRASE: ${{ secrets.SHIM_WEBUI_PASSPHRASE }}
-          GH_OWNER: ${{ github.repository_owner }}
-          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
-          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          ACTIVATION_REASON: cold-start
         run: |
-          SHIM_ROOT="/home/runner/shim" \
-          SHIM_WEBUI_SECRET="${SHIM_WEBUI_SECRET}" \
-          SHIM_WEBUI_PASSPHRASE="${SHIM_WEBUI_PASSPHRASE}" \
-          GH_OWNER="${GH_OWNER}" \
-          PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" \
-          SHIM_PAT="${SHIM_PAT}" \
-          nohup python3 -m uvicorn webui_server:app --host 127.0.0.1 --port 8090 \
-            --app-dir /home/runner/shim/repo/vps-shim/telegram \
-            > /home/runner/shim/repo/vps-shim/logs/webui.log 2>&1 &
-          echo "web UI server launched, pid $!"
+          bash /home/runner/shim/repo/vps-shim/scripts/activate.sh
 
-      - name: Attach web UI tunnel
-        env:
-          GH_OWNER: ${{ github.repository_owner }}
-          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
-          SHIM_PAT: ${{ secrets.SHIM_PAT }}
-        run: |
-          TUNNEL_LOCAL_PORT=8090 \
-          TUNNEL_STATUS_REPO_PATH="vps-shim/state/webui_tunnel.json" \
-          TUNNEL_STATUS_BOT_NAME="vps-shim-webui" \
-          TUNNEL_STATUS_GITHUB_PAT="${SHIM_PAT}" \
-          TUNNEL_STATUS_GITHUB_OWNER="${GH_OWNER}" \
-          TUNNEL_STATUS_PRIVATE_REPO="${PRIVATE_REPO_NAME}" \
-          nohup python3 /home/runner/shim/repo/vps-shim/telegram/tunnel_manager.py run \
-            > /home/runner/shim/repo/vps-shim/logs/webui_tunnel.log 2>&1 &
-          echo "web UI tunnel manager launched, pid $!"
-
-      - name: Sync loop within budget
+      - name: Sync loop within budget (dispatches standby at T-20m, hands off at T-0)
         env:
           START_EPOCH: ${{ steps.start.outputs.start_epoch }}
           GH_OWNER: ${{ github.repository_owner }}
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
         run: |
-          PUSH_INTERVAL=60
-          LAST_PUSH=0
-          SHIM_ROOT=/home/runner/shim
-          while true; do
-            NOW=$(date +%s)
-            ELAPSED=$((NOW - START_EPOCH))
-            REMAINING=$((RUN_BUDGET_SECONDS - ELAPSED))
-            if [ "$REMAINING" -le 60 ]; then
-              python3 -c "import sys; sys.path.insert(0, '$SHIM_ROOT/repo/vps-shim/telegram'); import launched; launched.shutdown_all()"
-              bash "$SHIM_ROOT/repo/vps-shim/scripts/git_push.sh" "checkpoint: session end"
-              break
-            fi
-            if [ $((NOW - LAST_PUSH)) -ge "$PUSH_INTERVAL" ]; then
-              bash "$SHIM_ROOT/repo/vps-shim/scripts/git_push.sh" "checkpoint: periodic" || true
-              LAST_PUSH=$NOW
-            fi
-            sleep 10
-          done
+          bash /home/runner/shim/repo/vps-shim/scripts/sync_loop.sh
 
-      # v14 fix: these two steps used to be `if: always()`, on the theory
-      # that a successor should still be chained even if the sync loop
-      # failed for a non-cancellation reason (network blip, transient
-      # error, etc). But `always()` also fires when the JOB ITSELF was
-      # cancelled -- e.g. by shimdeploy.py's cancel_inflight_runs() during
-      # a redeploy -- and a cancelled run has no business chaining a
-      # successor at all, since shimdeploy.py's own step 6 (or the
-      # watchdog) already dispatches the next run. Without this guard you
-      # get two runners racing: the cancelled run's own tail *and* the
-      # fresh dispatch from shimdeploy.py, exactly as observed.
-      #
-      # GitHub's `cancelled()` status-check function is the correct tool
-      # here (not a per-step `steps.<id>.conclusion` check): it reflects
-      # whether this workflow run received a cancellation signal at all,
-      # regardless of which step was executing when SIGINT/SIGTERM hit.
-      # Docs: on cancellation, the runner sends SIGINT then SIGTERM to
-      # the active step, and the server re-evaluates `if` conditions for
-      # remaining steps -- `cancelled()` is exposed precisely so those
-      # remaining steps can detect this and opt out.
-      #
-      # Net effect: run on success OR ordinary (non-cancelled) failure,
-      # but never after cancellation. A cancelled session just dies.
-      - name: Enforced downtime gap (real sleep, not cron)
-        if: always() && !cancelled()
-        run: |
-          echo "Sleeping ${DOWNTIME_GAP_SECONDS}s before dispatching the successor."
-          echo "This is the actual downtime -- nothing runs during this window."
-          sleep "${DOWNTIME_GAP_SECONDS}"
-          echo "Downtime gap complete."
-
-      - name: Dispatch successor session
-        if: always() && !cancelled()
+  standby:
+    if: github.event.action == 'dispatch-standby-shim-runner'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - name: Setup environment (ahead of promotion)
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
         run: |
-          echo "Dispatching next session via repository_dispatch."
-          curl -s -X POST \
-            -H "Authorization: token ${GH_TOKEN}" \
+          curl -s -H "Authorization: token ${SHIM_PAT}" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${{ github.repository }}/dispatches" \
-            -d '{"event_type":"restart-shim-runner"}'
-          echo "Dispatched. This runner's job ends now."
+            "https://api.github.com/repos/${GH_OWNER}/${PRIVATE_REPO_NAME}/contents/vps-shim/scripts/setup_env.sh" \
+            | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d['content']).decode())" \
+            > /tmp/setup_env.sh
+          chmod +x /tmp/setup_env.sh
+          SHIM_ROOT=/home/runner/shim GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" SHIM_PAT="${SHIM_PAT}" bash /tmp/setup_env.sh
+
+      - name: Wait for go-file (outgoing session's promotion signal)
+        id: wait
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          # Setup finished well before T-0 in the normal case (setup is
+          # a couple of minutes; the lead time is 20). Poll by re-pulling
+          # the checkpoint repo -- cheap, and it's how this job will see
+          # the go-file the outgoing session pushes at its own T-0.
+          #
+          # Ceiling: RUN_BUDGET_SECONDS + a generous margin, so a standby
+          # that somehow never sees a go-file (outgoing session crashed
+          # AFTER dispatching standby but BEFORE reaching its own T-0)
+          # doesn't wait forever and burn its whole 355-minute job
+          # allotment doing nothing -- it gives up and lets the
+          # watchdog's cold-start fallback take over instead.
+          WAIT_CEILING_SECONDS=1800
+          WAITED=0
+          GO_FILE="/home/runner/shim/repo/vps-shim/state/go_standby.json"
+          while [ ! -f "$GO_FILE" ]; do
+            if [ "$WAITED" -ge "$WAIT_CEILING_SECONDS" ]; then
+              echo "no go-file after ${WAIT_CEILING_SECONDS}s -- giving up, watchdog fallback will cold-start instead"
+              echo "promoted=0" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 15
+            WAITED=$((WAITED + 15))
+            bash /home/runner/shim/repo/vps-shim/scripts/git_pull.sh > /dev/null 2>&1 || true
+          done
+          echo "go-file found after ${WAITED}s -- promoting"
+          echo "promoted=1" >> "$GITHUB_OUTPUT"
+
+      - name: Record promotion time
+        id: promote_start
+        if: steps.wait.outputs.promoted == '1'
+        run: |
+          echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Activate (promoted -- becomes the new active session)
+        if: steps.wait.outputs.promoted == '1'
+        env:
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+          SHIM_ROOT: /home/runner/shim
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          MIAPORTAL_BASE_URL: ${{ vars.MIAPORTAL_BASE_URL }}
+          SHIM_WEBUI_SECRET: ${{ secrets.SHIM_WEBUI_SECRET }}
+          SHIM_WEBUI_PASSPHRASE: ${{ secrets.SHIM_WEBUI_PASSPHRASE }}
+          ACTIVATION_REASON: warm-handoff
+        run: |
+          # Consume the go-file so a stale copy can't cause a second,
+          # bogus promotion later (e.g. if this repo state were ever
+          # re-pulled without a fresh go-file present).
+          rm -f /home/runner/shim/repo/vps-shim/state/go_standby.json
+          bash /home/runner/shim/repo/vps-shim/scripts/activate.sh
+
+      - name: Sync loop within budget (now the active session)
+        if: steps.wait.outputs.promoted == '1'
+        env:
+          START_EPOCH: ${{ steps.promote_start.outputs.start_epoch }}
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+        run: |
+          bash /home/runner/shim/repo/vps-shim/scripts/sync_loop.sh

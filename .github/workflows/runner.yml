@@ -126,6 +126,22 @@ jobs:
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq tmux
 
+      - name: Put systemd-compat wrappers on PATH
+        run: |
+          # v33: meta_bot.py (hosted unmodified through the existing
+          # launch mechanism, exactly like any other launched process)
+          # calls real `systemctl restart <unit>` / `journalctl -u
+          # <unit> ...` -- neither binary exists on an Actions runner.
+          # telegram/launched.py's launch() never passes env= to
+          # Popen(), so a launched child inherits this job's PATH
+          # verbatim (confirmed by reading launch()'s Popen call
+          # directly, not assumed) -- prepending the wrapper dir here,
+          # before frontend_bot.py itself starts, is therefore
+          # sufficient for it to reach every process the shim launches,
+          # meta_bot.py included, with no per-launch special-casing.
+          echo "/home/runner/shim/repo/vps-shim/bin" >> "$GITHUB_PATH"
+          chmod +x /home/runner/shim/repo/vps-shim/bin/systemctl /home/runner/shim/repo/vps-shim/bin/journalctl
+
       - name: Resume launched processes from prior session
         env:
           GH_OWNER: ${{ github.repository_owner }}
@@ -170,6 +186,46 @@ jobs:
           nohup python3 /home/runner/shim/repo/vps-shim/telegram/frontend_bot.py \
             > /home/runner/shim/repo/vps-shim/logs/combined.log 2>&1 &
           echo "frontend bot launched, pid $!"
+
+      - name: Install web UI dependencies
+        run: |
+          pip install --quiet fastapi uvicorn
+
+      - name: Start web UI server
+        env:
+          SHIM_ROOT: /home/runner/shim
+          SHIM_WEBUI_SECRET: ${{ secrets.SHIM_WEBUI_SECRET }}
+          SHIM_WEBUI_PASSPHRASE: ${{ secrets.SHIM_WEBUI_PASSPHRASE }}
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          SHIM_ROOT="/home/runner/shim" \
+          SHIM_WEBUI_SECRET="${SHIM_WEBUI_SECRET}" \
+          SHIM_WEBUI_PASSPHRASE="${SHIM_WEBUI_PASSPHRASE}" \
+          GH_OWNER="${GH_OWNER}" \
+          PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" \
+          SHIM_PAT="${SHIM_PAT}" \
+          nohup python3 -m uvicorn webui_server:app --host 127.0.0.1 --port 8090 \
+            --app-dir /home/runner/shim/repo/vps-shim/telegram \
+            > /home/runner/shim/repo/vps-shim/logs/webui.log 2>&1 &
+          echo "web UI server launched, pid $!"
+
+      - name: Attach web UI tunnel
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          TUNNEL_LOCAL_PORT=8090 \
+          TUNNEL_STATUS_REPO_PATH="vps-shim/state/webui_tunnel.json" \
+          TUNNEL_STATUS_BOT_NAME="vps-shim-webui" \
+          TUNNEL_STATUS_GITHUB_PAT="${SHIM_PAT}" \
+          TUNNEL_STATUS_GITHUB_OWNER="${GH_OWNER}" \
+          TUNNEL_STATUS_PRIVATE_REPO="${PRIVATE_REPO_NAME}" \
+          nohup python3 /home/runner/shim/repo/vps-shim/telegram/tunnel_manager.py run \
+            > /home/runner/shim/repo/vps-shim/logs/webui_tunnel.log 2>&1 &
+          echo "web UI tunnel manager launched, pid $!"
 
       - name: Sync loop within budget
         env:

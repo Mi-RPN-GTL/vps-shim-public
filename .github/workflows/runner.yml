@@ -175,6 +175,7 @@ jobs:
           GH_OWNER: ${{ github.repository_owner }}
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          MIAPORTAL_BASE_URL: ${{ vars.MIAPORTAL_BASE_URL }}
         run: |
           LOGS_DIR="/home/runner/shim/repo/vps-shim/logs" \
           SHIM_ROOT="/home/runner/shim" \
@@ -183,6 +184,7 @@ jobs:
           GH_OWNER="${GH_OWNER}" \
           PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" \
           SHIM_PAT="${SHIM_PAT}" \
+          MIAPORTAL_BASE_URL="${MIAPORTAL_BASE_URL}" \
           nohup python3 /home/runner/shim/repo/vps-shim/telegram/frontend_bot.py \
             > /home/runner/shim/repo/vps-shim/logs/combined.log 2>&1 &
           echo "frontend bot launched, pid $!"

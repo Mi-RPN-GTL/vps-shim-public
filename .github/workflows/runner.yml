@@ -45,9 +45,40 @@ on:
   repository_dispatch:
     types: [restart-shim-runner]
 
+# v53 fix: cancel-in-progress was false, meaning a new dispatch queued
+# BEHIND whatever already held this group instead of displacing it.
+# That's fine when the prior run is healthy and finishing normally --
+# but when it's a GitHub-side stuck/zombie run (public status "queued"
+# forever, cancel API refuses with 409 -- see shimdeploy_lib.py's
+# cancel_inflight_runs() v52 fix notes for the full story), a queued
+# successor could be left waiting indefinitely behind a run that will
+# never clear on its own.
+#
+# cancel-in-progress: true moves cancellation from "shimdeploy.py's
+# API call, which can be refused by GitHub" to "the Actions engine's
+# own concurrency-group enforcement, which is unconditional" -- when a
+# new run enters this group, GitHub force-cancels whatever's currently
+# holding it, no cooperation from the old run required. This is the
+# only lever available that isn't subject to the same 409 stuck-state
+# bug, since it's enforced at dispatch time by GitHub itself rather
+# than by a cancel request that has to succeed against the same broken
+# run.
+#
+# Tradeoff, deliberately accepted: this also now applies to a HEALTHY,
+# currently-executing session, not just zombies. Manually triggering a
+# new run (or shimdeploy.py redeploying) while a good session is mid-
+# flight will cut it off immediately, rather than letting it finish
+# its own graceful shutdown (git_push.sh checkpoint, launched.shutdown_all())
+# first. In exchange for that, a stuck run can never again block a
+# legitimate redeploy from starting. Given this project's own rationale
+# for redeploying at all -- "new code takes over now, not whenever the
+# old run cycles" (see shimdeploy.py's module docstring, step 3) -- an
+# abrupt cutover is already the intended behavior for the normal
+# redeploy path; this just makes that same cutover reliable in the
+# stuck-run case too, instead of silently hanging.
 concurrency:
   group: vps-shim-runner
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 env:
   # 5h50m run budget, matching the proven pattern from the meta-site

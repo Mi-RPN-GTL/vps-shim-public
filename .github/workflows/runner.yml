@@ -115,8 +115,6 @@ jobs:
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
           MIAPORTAL_BASE_URL: ${{ vars.MIAPORTAL_BASE_URL }}
-          SHIM_WEBUI_SECRET: ${{ secrets.SHIM_WEBUI_SECRET }}
-          SHIM_WEBUI_PASSPHRASE: ${{ secrets.SHIM_WEBUI_PASSPHRASE }}
           ACTIVATION_REASON: cold-start
         run: |
           bash /home/runner/shim/repo/vps-shim/scripts/activate.sh
@@ -201,8 +199,6 @@ jobs:
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
           MIAPORTAL_BASE_URL: ${{ vars.MIAPORTAL_BASE_URL }}
-          SHIM_WEBUI_SECRET: ${{ secrets.SHIM_WEBUI_SECRET }}
-          SHIM_WEBUI_PASSPHRASE: ${{ secrets.SHIM_WEBUI_PASSPHRASE }}
           ACTIVATION_REASON: warm-handoff
         run: |
           # Consume the go-file so a stale copy can't cause a second,

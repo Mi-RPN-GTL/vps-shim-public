@@ -130,6 +130,15 @@ jobs:
         run: |
           bash /home/runner/shim/repo/vps-shim/scripts/sync_loop.sh
 
+      - name: Final checkpoint push (always, including on cancellation)
+        if: always()
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          bash /home/runner/shim/repo/vps-shim/scripts/git_push.sh "checkpoint: final (workflow always-run step)" || true
+
   standby:
     if: github.event.action == 'dispatch-standby-shim-runner'
     runs-on: ubuntu-latest
@@ -218,3 +227,12 @@ jobs:
           SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
         run: |
           bash /home/runner/shim/repo/vps-shim/scripts/sync_loop.sh
+
+      - name: Final checkpoint push (always, including on cancellation)
+        if: always()
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          bash /home/runner/shim/repo/vps-shim/scripts/git_push.sh "checkpoint: final (workflow always-run step)" || true

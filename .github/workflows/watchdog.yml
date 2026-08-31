@@ -11,7 +11,15 @@ jobs:
     steps:
       - name: Check last session heartbeat
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # v113 fix: was secrets.GITHUB_TOKEN. GitHub's anti-recursion
+          # protection silently prevents repository_dispatch events sent
+          # with the auto-generated GITHUB_TOKEN from triggering any
+          # workflow -- the dispatch POST still returns success, it just
+          # never starts a run. SHIM_PAT is a real PAT and isn't subject
+          # to that restriction (same reason sync_loop.sh's dispatches
+          # already use it). Needed for both the read calls and the
+          # healing dispatch POST below.
+          GH_TOKEN: ${{ secrets.SHIM_PAT }}
         run: |
           LAST_RUN=$(curl -s \
             -H "Authorization: token ${GH_TOKEN}" \

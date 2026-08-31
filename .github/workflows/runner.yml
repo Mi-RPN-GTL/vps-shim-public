@@ -75,6 +75,19 @@ env:
   # standby cycle already primed (e.g. very first cold start).
   DOWNTIME_GAP_SECONDS: 600
   STANDBY_DISPATCH_LEAD_SECONDS: 1200
+  # v113 fix: repository_dispatch only triggers workflows defined in
+  # the repo the event is POSTed to -- NOT wherever Actions minutes
+  # happen to be unlimited. runner.yml (the thing that has to receive
+  # dispatch-standby-shim-runner and actually run the `standby` job)
+  # lives in THIS repo, so the standby dispatch in sync_loop.sh must
+  # target this repo, not PRIVATE_REPO_NAME. Previously sync_loop.sh
+  # only received PRIVATE_REPO_NAME and reused it by mistake for the
+  # standby dispatch URL too, so the dispatch always 204'd (accepted)
+  # while triggering nothing -- there was no runner.yml listening on
+  # the private repo side. This was silent because a 204 to a repo
+  # with no matching workflow is not an error from GitHub's point of
+  # view, just a no-op.
+  RUNNER_REPO_NAME: ${{ github.event.repository.name }}
 
 jobs:
   session:
@@ -124,6 +137,7 @@ jobs:
           START_EPOCH: ${{ steps.start.outputs.start_epoch }}
           GH_OWNER: ${{ github.repository_owner }}
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          RUNNER_REPO_NAME: ${{ env.RUNNER_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
           SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
           SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
@@ -222,6 +236,7 @@ jobs:
           START_EPOCH: ${{ steps.promote_start.outputs.start_epoch }}
           GH_OWNER: ${{ github.repository_owner }}
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          RUNNER_REPO_NAME: ${{ env.RUNNER_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
           SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
           SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}

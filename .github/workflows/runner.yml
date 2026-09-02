@@ -40,14 +40,28 @@ name: VPS-Shim Runner
 # gap bounded by the watchdog's own poll interval, not an indefinite
 # stall.
 #
-# Both jobs share the SAME concurrency group as before
-# (vps-shim-runner, cancel-in-progress: true) specifically so that
+# Both jobs previously shared the SAME concurrency group so that
 # shimdeploy.py's redeploy path (disable workflow, then
-# cancel_inflight_runs() across the whole repo) still force-cancels
-# a `standby` run exactly like it does `session` -- a redeploy must
-# not leave a standby alive on stale code. cancel_inflight_runs()
-# cancels every active run repo-wide already (confirmed: it is not
-# scoped to a single workflow file), so no change was needed there.
+# cancel_inflight_runs() across the whole repo) could force-cancel a
+# `standby` run exactly like it does `session`. That sharing was a bug:
+# standby's own routine T-20m dispatch is not an exceptional redeploy
+# event, it's a guaranteed part of every session's normal lifecycle --
+# so cancel-in-progress on a shared group meant every standby dispatch
+# immediately killed its own still-running parent session, before that
+# session ever reached its own graceful T-0 shutdown / go-file push.
+# Every handoff self-destructed this way.
+#
+# `session` and `standby` now each have their OWN concurrency group
+# (vps-shim-runner-session / vps-shim-runner-standby), so dispatching
+# one can never cancel the other. This costs nothing on the redeploy
+# side: cancel_inflight_runs() cancels every active run repo-wide by
+# hitting the Actions API directly on run status -- confirmed it has no
+# dependency on concurrency groups at all -- so a redeploy still kills
+# both a live session and a live standby exactly as before.
+#
+# Within each group, cancel-in-progress is kept: two overlapping
+# `session` runs (e.g. a manual restart while one's already active)
+# still cancel each other, and likewise for two `standby` runs.
 #
 # What did NOT change from the prior revision: RUN_BUDGET_SECONDS
 # (5h50m), the reason schedule: cron is not used for anything
@@ -62,10 +76,6 @@ on:
   workflow_dispatch:
   repository_dispatch:
     types: [restart-shim-runner, dispatch-standby-shim-runner]
-
-concurrency:
-  group: vps-shim-runner
-  cancel-in-progress: true
 
 env:
   RUN_BUDGET_SECONDS: 21000
@@ -94,6 +104,9 @@ jobs:
     if: github.event_name == 'workflow_dispatch' || github.event.action == 'restart-shim-runner'
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    concurrency:
+      group: vps-shim-runner-session
+      cancel-in-progress: true
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main
@@ -168,6 +181,9 @@ jobs:
     if: github.event.action == 'dispatch-standby-shim-runner'
     runs-on: ubuntu-latest
     timeout-minutes: 355
+    concurrency:
+      group: vps-shim-runner-standby
+      cancel-in-progress: true
     steps:
       - name: Free disk space
         uses: jlumbroso/free-disk-space@main

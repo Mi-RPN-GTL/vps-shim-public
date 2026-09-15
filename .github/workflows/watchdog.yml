@@ -1,0 +1,273 @@
+name: VPS-Shim Watchdog
+
+on:
+  # v198d-teardown-path: 20m -> 1m poll. GitHub Actions schedule cron
+  # is best-effort and can slip under load, but a 1m interval still
+  # tightens the realistic worst-case gap by roughly the same factor
+  # as the 40m -> 5m threshold change below, and this is now a much
+  # cheaper job to run frequently than it was worth running frequently
+  # at the old 40m threshold (a few curl calls, no checkout).
+  schedule:
+    - cron: '* * * * *'
+  workflow_dispatch:
+
+jobs:
+  check-and-heal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write watchdog-down-event helper script
+        # v196: a separate step (its own plain file, not an inline
+        # python3 -c string nested inside the run block below) so the
+        # script's own braces/quoting can never collide with this
+        # workflow's YAML block-scalar indentation or the bash step's
+        # own quoting -- keeping the two previously-separate concerns
+        # (bash orchestration vs. the Contents-API PUT logic) in
+        # separate files entirely, rather than string-building one
+        # inside the other.
+        run: |
+          cat > /tmp/write_watchdog_down_event.py <<'PYEOF'
+          import base64, json, os, urllib.request
+          owner = os.environ['GH_OWNER']
+          repo = os.environ['PRIVATE_REPO_NAME']
+          pat = os.environ['GH_TOKEN']
+          down_epoch = int(os.environ['DOWN_EPOCH'])
+          down_iso = os.environ['DOWN_ISO']
+          path = 'vps-shim/state/downtime_log.jsonl'
+          url = f'https://api.github.com/repos/{owner}/{repo}/contents/{path}'
+          headers = {'Authorization': f'token {pat}', 'Accept': 'application/vnd.github.v3+json'}
+          req = urllib.request.Request(url, headers=headers)
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  body = json.load(resp)
+              existing = base64.b64decode(body['content']).decode('utf-8')
+              sha = body.get('sha')
+          except Exception:
+              existing = ''
+              sha = None
+          event = {'event': 'down', 'reason': 'watchdog-detected-gap', 'epoch': down_epoch, 'iso': down_iso}
+          updated = existing + json.dumps(event) + '\n'
+          put_body = {'message': 'downtime log: watchdog-detected gap', 'content': base64.b64encode(updated.encode('utf-8')).decode('ascii')}
+          if sha:
+              put_body['sha'] = sha
+          put_req = urllib.request.Request(url, data=json.dumps(put_body).encode('utf-8'), headers={**headers, 'Content-Type': 'application/json'}, method='PUT')
+          try:
+              urllib.request.urlopen(put_req, timeout=15)
+              print('PHASE: wrote watchdog-detected-gap down event')
+          except Exception as e:
+              print(f'PHASE: failed to write down event (non-fatal): {e}')
+          PYEOF
+          sed -i 's/^          //' /tmp/write_watchdog_down_event.py
+
+      - name: Write heartbeat-check helper script
+        # v202-heartbeat: a separate file for the same reason the
+        # down-event helper above is one -- keeps the Contents-API
+        # read/staleness logic out of the bash step's own quoting.
+        # Reads vps-shim/state/session_heartbeat.json (written every
+        # ~30s by sync_loop.sh -- see that script's own comments) via
+        # the same no-checkout Contents-API GET pattern used
+        # throughout this codebase (launched.fetch_handoff_manifest_remote,
+        # the down-event PUT above). A MISSING heartbeat file (never
+        # written -- e.g. a pre-v202 deployment, or a session still in
+        # its first ~30s) is reported as fresh=1, not stale=1: this
+        # fix's whole purpose is to stop trusting a WEDGED run, not to
+        # start distrusting a genuinely young or old-version one that
+        # simply has no heartbeat data yet. Absence of evidence a run
+        # is wedged must not be treated as evidence it IS wedged.
+        run: |
+          cat > /tmp/check_heartbeat.py <<'PYEOF'
+          import base64, json, os, sys, time, urllib.request
+          owner = os.environ['GH_OWNER']
+          repo = os.environ['PRIVATE_REPO_NAME']
+          pat = os.environ['GH_TOKEN']
+          stale_seconds = int(os.environ['STALE_SECONDS'])
+          path = 'vps-shim/state/session_heartbeat.json'
+          url = f'https://api.github.com/repos/{owner}/{repo}/contents/{path}'
+          headers = {'Authorization': f'token {pat}', 'Accept': 'application/vnd.github.v3+json'}
+          req = urllib.request.Request(url, headers=headers)
+          try:
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  body = json.load(resp)
+              content = base64.b64decode(body['content']).decode('utf-8')
+              hb = json.loads(content)
+              hb_epoch = int(hb['epoch'])
+          except Exception as e:
+              # No heartbeat file yet (404), unreadable, or malformed --
+              # see docstring above: treat as "no evidence of a hang",
+              # not as "confirmed wedged". A run this genuinely stuck
+              # will eventually age out via its own timeout-minutes
+              # ceiling regardless; this fix only needs to catch the
+              # case where a heartbeat EXISTS and is stale.
+              print(f'PHASE: no usable heartbeat found ({e}) -- treating as fresh, not healing on this basis')
+              print('fresh=1')
+              sys.exit(0)
+          age = int(time.time()) - hb_epoch
+          if age > stale_seconds:
+              print(f'PHASE: heartbeat is {age}s old (> {stale_seconds}s threshold) -- run appears wedged')
+              print('fresh=0')
+          else:
+              print(f'PHASE: heartbeat is {age}s old (<= {stale_seconds}s threshold) -- run appears healthy')
+              print('fresh=1')
+          PYEOF
+          sed -i 's/^          //' /tmp/check_heartbeat.py
+
+      - name: Cancel a run
+        # v202-heartbeat: extracted into its own reusable step-adjacent
+        # script rather than inlined twice (used both for cancelling a
+        # confirmed-wedged run below, and available the same way for
+        # any future caller) -- takes a run id on stdin-equivalent env
+        # var, POSTs the Actions API's own cancel endpoint. This is a
+        # graceful-cancel REQUEST, same as clicking "Cancel workflow"
+        # in the UI -- it does not guarantee instant termination (a
+        # run can take a short while to actually stop), but it does
+        # ensure GitHub itself, not just this watchdog's own belief,
+        # eventually marks the run non-in_progress -- so even if the
+        # very next watchdog tick (1 minute later) still sees it as
+        # in_progress momentarily, it will not still be wedged-forever
+        # from GitHub's own perspective.
+        run: |
+          cat > /tmp/cancel_run.sh <<'EOF'
+          curl -s -X POST \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GH_OWNER}/${RUNNER_REPO}/actions/runs/${CANCEL_RUN_ID}/cancel"
+          EOF
+          sed -i 's/^          //' /tmp/cancel_run.sh
+          chmod +x /tmp/cancel_run.sh
+
+      - name: Check last session heartbeat
+        env:
+          # v113 fix: was secrets.GITHUB_TOKEN. GitHub's anti-recursion
+          # protection silently prevents repository_dispatch events sent
+          # with the auto-generated GITHUB_TOKEN from triggering any
+          # workflow -- the dispatch POST still returns success, it just
+          # never starts a run. SHIM_PAT is a real PAT and isn't subject
+          # to that restriction (same reason sync_loop.sh's dispatches
+          # already use it). Needed for both the read calls and the
+          # healing dispatch POST below.
+          GH_TOKEN: ${{ secrets.SHIM_PAT }}
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+        run: |
+          LAST_RUN=$(curl -s \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/runner.yml/runs?per_page=1&status=completed" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); r=d.get('workflow_runs',[]); print(r[0]['updated_at'] if r else '')")
+
+          if [ -z "$LAST_RUN" ]; then
+            echo "no completed runs found, dispatching a fresh session"
+            SHOULD_HEAL=1
+          else
+            LAST_EPOCH=$(date -d "$LAST_RUN" +%s)
+            NOW_EPOCH=$(date +%s)
+            GAP=$((NOW_EPOCH - LAST_EPOCH))
+            echo "last completed session was ${GAP}s ago"
+            # v198d-teardown-path: 2400s (40m) -> 300s (5m), paired with
+            # the 1m poll interval above. The old 40m threshold existed
+            # to tolerate a 20m poll cadence with margin; at 1m polling
+            # that margin is unnecessary and was just adding cold-gap
+            # time on top of every genuine outage. 300s still comfortably
+            # exceeds a single missed/slipped cron tick.
+            if [ "$GAP" -gt 300 ]; then
+              SHOULD_HEAL=1
+            else
+              SHOULD_HEAL=0
+            fi
+          fi
+
+          if [ "$SHOULD_HEAL" = "1" ]; then
+            IN_PROGRESS_IDS=$(curl -s \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/workflows/runner.yml/runs?per_page=5&status=in_progress" \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print('\n'.join(str(r['id']) for r in d.get('workflow_runs',[])))")
+
+            if [ -n "$IN_PROGRESS_IDS" ]; then
+              # v202-heartbeat: previously this alone ("an in_progress
+              # run exists") was treated as proof of health and ended
+              # the whole check right here -- exit 0, no healing, no
+              # matter how long that run had actually been wedged for.
+              # A run crashed/force-cancelled/stuck mid-teardown before
+              # ever reaching sync_loop.sh's own graceful shutdown could
+              # sit in_progress for HOURS (until its own 355-minute
+              # timeout-minutes ceiling eventually fired), and every
+              # single watchdog tick in between would see it, defer,
+              # and stand down -- exactly the flaw that produced "it's
+              # been 15+ minutes and the watchdog still hasn't healed
+              # it" with no error anywhere, because from the watchdog's
+              # old point of view nothing WAS wrong: a session was
+              # "in progress", full stop, no further question asked.
+              #
+              # Now: read the current session's own heartbeat (written
+              # every ~30s by sync_loop.sh, to ONE shared path -- there
+              # is normally at most one in_progress run at a time, since
+              # session/standby each have their own cancel-in-progress
+              # concurrency group, so one shared heartbeat file
+              # correctly describes "the currently active run" without
+              # needing a per-run-id path) and only stand down if it's
+              # actually fresh. STALE_SECONDS=90 gives 3 full heartbeat
+              # intervals of slack over sync_loop.sh's 30s write
+              # cadence -- comfortably above a single slow API call or
+              # transient network blip, while still catching a
+              # genuinely wedged run within roughly 1-2 watchdog ticks
+              # of it going stale, not hours.
+              #
+              # If somehow MORE than one run is in_progress at once
+              # (e.g. a manual workflow_dispatch racing an existing
+              # session -- concurrency groups reduce this but a check-
+              # then-act gap always leaves a small window), the single
+              # heartbeat can only ever vouch for whichever run last
+              # wrote it -- so a stale reading here means "cancel every
+              # in_progress run we found and start clean," rather than
+              # trying to guess which specific id the heartbeat belongs
+              # to and leaving the rest untouched.
+              RESULT=$(GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" GH_TOKEN="${GH_TOKEN}" STALE_SECONDS=90 python3 /tmp/check_heartbeat.py)
+              echo "$RESULT"
+              FRESH=$(echo "$RESULT" | grep -o 'fresh=[01]' | cut -d= -f2)
+
+              if [ "$FRESH" = "1" ]; then
+                echo "a session is already in progress with a fresh (or absent, pre-v202) heartbeat, not healing"
+                exit 0
+              fi
+
+              # Heartbeat exists and is stale: treat every currently
+              # in_progress runner.yml run as wedged. Cancel each one
+              # before dispatching a replacement, so GitHub's own
+              # bookkeeping (not just this watchdog's belief) marks it
+              # non-in_progress, and it can't keep shadowing every
+              # future tick's IN_PROGRESS_IDS query.
+              echo "heartbeat is stale -- treating in_progress run(s) as wedged, cancelling before healing"
+              for RID in $IN_PROGRESS_IDS; do
+                echo "cancelling wedged run ${RID}"
+                GH_TOKEN="${GH_TOKEN}" GH_OWNER="${GH_OWNER}" RUNNER_REPO="${{ github.event.repository.name }}" CANCEL_RUN_ID="$RID" bash /tmp/cancel_run.sh
+              done
+            fi
+
+            echo "dispatching a fresh session"
+            curl -s -X POST \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              "https://api.github.com/repos/${{ github.repository }}/dispatches" \
+              -d '{"event_type":"restart-shim-runner"}'
+
+            # v196: record a "down" event for this ungraceful gap, using
+            # the last completed session's own updated_at as the down
+            # epoch (the best available approximation of when it
+            # actually stopped serving -- LAST_RUN itself, computed
+            # above). Previously NOTHING wrote a "down" event for any
+            # session that didn't reach sync_loop.sh's own graceful
+            # budget-exhausted shutdown block (crash, kill, force-cancel
+            # before T-0) -- render_downtime_log()/the web UI's gap
+            # computation pairs each "up" with the "down" immediately
+            # before it in the file, so a missing "down" meant the next
+            # "up" silently showed no gap at all instead of an unknown-
+            # but-real one. Written directly via the Contents API (same
+            # mechanism launched.py's _write_json already uses for every
+            # other piece of cross-VM state) since this workflow has no
+            # working-tree checkout of its own to append a local file to.
+            if [ -n "$LAST_RUN" ]; then
+              LAST_EPOCH_FOR_DOWN=$(date -d "$LAST_RUN" +%s)
+              LAST_ISO_FOR_DOWN=$(date -u -d "@${LAST_EPOCH_FOR_DOWN}" '+%Y-%m-%dT%H:%M:%SZ')
+              DOWN_EPOCH="$LAST_EPOCH_FOR_DOWN" DOWN_ISO="$LAST_ISO_FOR_DOWN" python3 /tmp/write_watchdog_down_event.py
+            fi
+          fi

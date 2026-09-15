@@ -1,0 +1,415 @@
+name: VPS-Shim Runner
+
+# ══════════════════════════════════════════════════════════════════
+# Warm-handoff model (this revision).
+#
+# Two jobs, same workflow file, same concurrency group:
+#
+#   `session` -- the currently-active job. Runs setup, activates
+#   (bot/webui/tunnel + resumes prior launched processes), then runs
+#   the shared sync loop (vps-shim/scripts/sync_loop.sh). At T-20m
+#   remaining in its own budget, it dispatches a `standby` run via
+#   repository_dispatch (event: dispatch-standby-shim-runner). At its
+#   own budget end it shuts down, checkpoints, writes+pushes a
+#   go-file (vps-shim/state/go_standby.json), and exits. It no longer
+#   dispatches its successor directly -- that's `standby`'s job now,
+#   once `standby` sees the go-file.
+#
+#   `standby` -- dispatched ~20 minutes before the current session
+#   ends. Runs the SAME setup (setup_env.sh) ahead of time, on its
+#   own fresh runner VM, then polls for the go-file. The moment it
+#   sees one, it activates (same activate.sh session uses) and falls
+#   into the same sync_loop.sh -- becoming the new active session, in
+#   place, on the same job/run. It will itself dispatch the next
+#   standby at ITS OWN T-20m, via the same sync_loop.sh logic.
+#
+# This means there is close to zero cold gap between one session
+# ending and its successor being ready: standby's setup (venv, deps,
+# cloudflared install, etc) already happened during the outgoing
+# session's last 20 minutes, in parallel, on a separate VM. The only
+# serialized part is: outgoing session's own shutdown + checkpoint
+# push + go-file push, then standby's git pull of that checkpoint +
+# activation -- seconds, not the old 10-minute enforced cold gap.
+#
+# FALLBACK (no standby was ever dispatched -- session crashed/was
+# cancelled before reaching T-20m, or the dispatch call itself
+# failed): nothing here recovers that automatically. watchdog.yml
+# polls every 20 minutes; if it sees no completed runner.yml run
+# recently and nothing in_progress, it dispatches a fresh cold
+# `restart-shim-runner` session exactly as before. Worst case is a
+# gap bounded by the watchdog's own poll interval, not an indefinite
+# stall.
+#
+# Both jobs previously shared the SAME concurrency group so that
+# shimdeploy.py's redeploy path (disable workflow, then
+# cancel_inflight_runs() across the whole repo) could force-cancel a
+# `standby` run exactly like it does `session`. That sharing was a bug:
+# standby's own routine T-20m dispatch is not an exceptional redeploy
+# event, it's a guaranteed part of every session's normal lifecycle --
+# so cancel-in-progress on a shared group meant every standby dispatch
+# immediately killed its own still-running parent session, before that
+# session ever reached its own graceful T-0 shutdown / go-file push.
+# Every handoff self-destructed this way.
+#
+# `session` and `standby` now each have their OWN concurrency group
+# (vps-shim-runner-session / vps-shim-runner-standby), so dispatching
+# one can never cancel the other. This costs nothing on the redeploy
+# side: cancel_inflight_runs() cancels every active run repo-wide by
+# hitting the Actions API directly on run status -- confirmed it has no
+# dependency on concurrency groups at all -- so a redeploy still kills
+# both a live session and a live standby exactly as before.
+#
+# `session`'s group keeps cancel-in-progress: two overlapping `session`
+# runs (e.g. a manual restart while one's already active) should still
+# cancel each other -- there is never a reason to run two active
+# sessions side by side.
+#
+# `standby`'s group is back to cancel-in-progress: true as of
+# v199-guard-standby (v198d-teardown-path had set it to false --
+# reverted; see below for why). A duplicate standby dispatch (two
+# sessions each independently reaching their own T-20m in close
+# succession, a manual re-dispatch, etc.) is resolved the same way it
+# was before v198d: the newer run evicts the older one. This IS what
+# killed #136 (a standby cancelled after waiting 5h50m, with no way to
+# know it was about to see the go-file) -- v198d's response was to drop
+# cancel-in-progress entirely and add claim_standby.sh instead. That
+# fix didn't hold up: v198d has never once completed a warm handoff,
+# where the prior cancel-in-progress:true revision did so occasionally.
+# Root cause of the regression: removing cancel-in-progress didn't just
+# stop the *bad* cancellations, it stopped standby cleanup entirely --
+# stale/duplicate standby runs now accumulate and sit waiting instead of
+# ever being resolved, and claim_standby.sh's file-based race only ever
+# matters AFTER a go-file appears, so it does nothing for the more
+# common failure mode (a go-file that's late, lost, or never written).
+#
+# IMPORTANT -- what reverting to true actually fixes, and what it can't:
+# GitHub's own concurrency docs are explicit that a QUEUED run in a
+# group is evicted unconditionally by a newer dispatch, REGARDLESS of
+# cancel-in-progress -- that setting only governs a run that's already
+# RUNNING. And a RUNNING job cancelled via cancel-in-progress is killed
+# outright (confirmed: no SIGINT/SIGTERM grace window the job's own code
+# can catch, unlike a plain step cancellation) -- there is no in-job
+# trap, signal handler, or "finish what you're doing first" mechanism
+# that can intercept either kind of eviction once GitHub decides to act.
+# #136's actual failure (a standby killed while genuinely about to
+# promote) is therefore NOT fixable by anything running inside the
+# standby job itself, with cancel-in-progress true OR false -- so this
+# revision does not attempt to. What IS fixable, and what v199 actually
+# does:
+#   1) sync_loop.sh's own T-20m dispatch now checks the Actions API for
+#      an existing queued/in_progress runner.yml run before dispatching
+#      a new standby, and skips the dispatch if one is already found --
+#      closing the routine, self-inflicted case (this shim dispatching
+#      a second standby onto its own still-waiting first one) that #136
+#      actually was. This can't see every possible race (a manual
+#      workflow_dispatch landing in the same few seconds isn't covered
+#      by a check-then-act pair of API calls), but it makes "there is
+#      something to cancel" the rare case again, not the routine one.
+#   2) The go-file write+push path (sync_loop.sh) is now retried and
+#      loudly alerted on failure, instead of a single unguarded attempt
+#      that could silently skip the go-file entirely under `set -e`.
+#      A standby that's genuinely still alive and waiting should now
+#      reliably see the go-file the moment its session ends, which is
+#      what actually determines whether a handoff can go warm at all.
+# claim_standby.sh (state/standby_claim.json) is left in place, unused
+# in the common case now that cancel-in-progress again keeps at most one
+# standby alive most of the time -- it's a harmless backstop for the
+# residual race window (1) can't close, not load-bearing the way it was
+# under v198d.
+#
+# What did NOT change from the prior revision: RUN_BUDGET_SECONDS
+# (5h50m), the reason schedule: cron is not used for anything
+# timing-sensitive (see prior notes, still true), the mechanics of
+# git_pull.sh/git_push.sh, and cancel-in-progress's tradeoff on the
+# `session` group specifically (a healthy mid-flight session gets cut
+# off immediately by a manual redeploy rather than finishing
+# gracefully -- deliberately accepted, see prior notes).
+#
+# v198d-teardown-path's tightening of the watchdog's own cold-start
+# fallback (watchdog.yml: poll interval 20m -> 1m, gap threshold 40m ->
+# 5m) is KEPT -- that fallback is what still catches every case this
+# revision doesn't (the residual race window in (1), a go-file that
+# still somehow never reaches standby, etc.), so it stays a tight
+# backstop rather than a wide one, same reasoning as before, just no
+# longer the ONLY layer of defense the way it was under v198d.
+# standing between an edge case and an empty system, but it still needs
+# to be a tight backstop, not just a wide one.
+# ══════════════════════════════════════════════════════════════════
+
+on:
+  workflow_dispatch:
+  repository_dispatch:
+    types: [restart-shim-runner, dispatch-standby-shim-runner]
+
+env:
+  RUN_BUDGET_SECONDS: 21000
+  # Retained for the fallback/manual path only -- standby's normal
+  # dispatch has no fixed sleep gap (see header). Kept in case a
+  # manual workflow_dispatch of `session` is ever used without a
+  # standby cycle already primed (e.g. very first cold start).
+  DOWNTIME_GAP_SECONDS: 600
+  STANDBY_DISPATCH_LEAD_SECONDS: 1200
+  # v113 fix: repository_dispatch only triggers workflows defined in
+  # the repo the event is POSTed to -- NOT wherever Actions minutes
+  # happen to be unlimited. runner.yml (the thing that has to receive
+  # dispatch-standby-shim-runner and actually run the `standby` job)
+  # lives in THIS repo, so the standby dispatch in sync_loop.sh must
+  # target this repo, not PRIVATE_REPO_NAME. Previously sync_loop.sh
+  # only received PRIVATE_REPO_NAME and reused it by mistake for the
+  # standby dispatch URL too, so the dispatch always 204'd (accepted)
+  # while triggering nothing -- there was no runner.yml listening on
+  # the private repo side. This was silent because a 204 to a repo
+  # with no matching workflow is not an error from GitHub's point of
+  # view, just a no-op.
+  RUNNER_REPO_NAME: ${{ github.event.repository.name }}
+
+jobs:
+  session:
+    if: github.event_name == 'workflow_dispatch' || github.event.action == 'restart-shim-runner'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    concurrency:
+      group: vps-shim-runner-session
+      cancel-in-progress: true
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+          docker-images: true
+
+      - name: Record session start
+        id: start
+        run: |
+          START_EPOCH=$(date +%s)
+          echo "start_epoch=${START_EPOCH}" >> "$GITHUB_OUTPUT"
+          echo "Session started at $(date -u -d @${START_EPOCH} '+%Y-%m-%d %H:%M:%S UTC')"
+
+      - name: Setup environment
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          # setup_env.sh isn't on disk yet on a fresh runner -- bootstrap
+          # it the same way git_pull.sh used to be bootstrapped, then
+          # hand off to the checked-out copy for everything after.
+          curl -s -H "Authorization: token ${SHIM_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GH_OWNER}/${PRIVATE_REPO_NAME}/contents/vps-shim/scripts/setup_env.sh" \
+            | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d['content']).decode())" \
+            > /tmp/setup_env.sh
+          chmod +x /tmp/setup_env.sh
+          SHIM_ROOT=/home/runner/shim GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" SHIM_PAT="${SHIM_PAT}" bash /tmp/setup_env.sh
+
+      - name: Activate (launch bot/webui/tunnel, resume processes)
+        env:
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+          SHIM_ROOT: /home/runner/shim
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          MIAPORTAL_BASE_URL: ${{ vars.MIAPORTAL_BASE_URL }}
+          ACTIVATION_REASON: cold-start
+        run: |
+          bash /home/runner/shim/repo/vps-shim/scripts/activate.sh
+
+      - name: Sync loop within budget (dispatches standby at T-20m, hands off at T-0)
+        env:
+          START_EPOCH: ${{ steps.start.outputs.start_epoch }}
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          RUNNER_REPO_NAME: ${{ env.RUNNER_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+        run: |
+          bash /home/runner/shim/repo/vps-shim/scripts/sync_loop.sh
+
+      - name: Final checkpoint push (always, including on cancellation)
+        if: always()
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          bash /home/runner/shim/repo/vps-shim/scripts/git_push.sh "checkpoint: final (workflow always-run step)" || true
+
+  standby:
+    if: github.event.action == 'dispatch-standby-shim-runner'
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    concurrency:
+      group: vps-shim-runner-standby
+      cancel-in-progress: true
+    steps:
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: true
+          docker-images: true
+
+      - name: Setup environment (ahead of promotion)
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          curl -s -H "Authorization: token ${SHIM_PAT}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/repos/${GH_OWNER}/${PRIVATE_REPO_NAME}/contents/vps-shim/scripts/setup_env.sh" \
+            | python3 -c "import sys,json,base64; d=json.load(sys.stdin); print(base64.b64decode(d['content']).decode())" \
+            > /tmp/setup_env.sh
+          chmod +x /tmp/setup_env.sh
+          SHIM_ROOT=/home/runner/shim GH_OWNER="${GH_OWNER}" PRIVATE_REPO_NAME="${PRIVATE_REPO_NAME}" SHIM_PAT="${SHIM_PAT}" bash /tmp/setup_env.sh
+
+      - name: Wait for go-file (outgoing session's promotion signal)
+        id: wait
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          # Setup finished well before T-0 in the normal case (setup is
+          # a couple of minutes; the lead time is 20). Poll by re-pulling
+          # the checkpoint repo -- cheap, and it's how this job will see
+          # the go-file the outgoing session pushes at its own T-0.
+          #
+          # Ceiling: RUN_BUDGET_SECONDS + a generous margin, so a standby
+          # that somehow never sees a go-file (outgoing session crashed
+          # AFTER dispatching standby but BEFORE reaching its own T-0)
+          # doesn't wait forever and burn its whole 355-minute job
+          # allotment doing nothing -- it gives up and lets the
+          # watchdog's cold-start fallback take over instead.
+          WAIT_CEILING_SECONDS=1800
+          WAITED=0
+          GO_FILE="/home/runner/shim/repo/vps-shim/state/go_standby.json"
+          while [ ! -f "$GO_FILE" ]; do
+            if [ "$WAITED" -ge "$WAIT_CEILING_SECONDS" ]; then
+              echo "no go-file after ${WAIT_CEILING_SECONDS}s -- giving up, watchdog fallback will cold-start instead"
+              echo "promoted=0" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 15
+            WAITED=$((WAITED + 15))
+            bash /home/runner/shim/repo/vps-shim/scripts/git_pull.sh > /dev/null 2>&1 || true
+          done
+          echo "go-file found after ${WAITED}s -- promoting"
+          echo "promoted=1" >> "$GITHUB_OUTPUT"
+          GO_EPOCH=$(python3 -c "import json; print(json.load(open('$GO_FILE'))['go_epoch'])")
+          echo "go_epoch=${GO_EPOCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Claim promotion (backstop only as of v199-guard-standby -- see runner.yml header)
+        id: claim
+        if: steps.wait.outputs.promoted == '1'
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          # Bounded retries: an operational failure here (push/pull
+          # error -- network blip, transient API error) must NOT be
+          # treated as a loss. Only an explicit "LOST" from
+          # claim_standby.sh (meaning another run's claim was actually
+          # read back) counts as losing. Conflating the two would mean
+          # a flaky network call could make every standby yield and
+          # nobody ever promote -- exactly the "shift the problem"
+          # failure mode this whole redesign is trying to avoid.
+          RESULT=""
+          for attempt in 1 2 3 4 5; do
+            if OUT=$(bash /home/runner/shim/repo/vps-shim/scripts/claim_standby.sh \
+                "${{ steps.wait.outputs.go_epoch }}" 2>&1); then
+              RESULT=$(echo "$OUT" | tail -1)
+              echo "$OUT"
+              break
+            fi
+              echo "$OUT"
+              echo "claim attempt ${attempt} failed operationally, retrying..."
+              sleep $((attempt * 5))
+          done
+          if [ "$RESULT" = "WON" ]; then
+            echo "won=1" >> "$GITHUB_OUTPUT"
+          elif [ "$RESULT" = "LOST" ]; then
+            echo "won=0" >> "$GITHUB_OUTPUT"
+          else
+            # All 5 attempts failed operationally with no definitive
+            # WON/LOST answer. Do NOT default to yielding -- that
+            # silently loses the promotion with no one left to notice.
+            # Default to proceeding: if another standby genuinely won,
+            # activate.sh's own resume-processes step is what would
+            # actually collide, and that's a narrower, more visible
+            # failure (loud Telegram resume-failure alerts already
+            # exist for it, see activate.sh) than two runners silently
+            # both declining to come up at all.
+            echo "warning: claim check inconclusive after 5 attempts -- proceeding rather than risking a silent no-promotion" >&2
+            echo "won=1" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify yield (lost the claim race)
+        if: steps.wait.outputs.promoted == '1' && steps.claim.outputs.won == '0'
+        env:
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+        run: |
+          echo "another standby already claimed this go_epoch -- yielding, exiting cleanly"
+          curl -s -X POST "https://api.telegram.org/bot${SHIM_BOT_TOKEN}/sendMessage" \
+            -d "chat_id=${SHIM_OWNER_CHAT_ID}" \
+            -d "text=🟡 vps-shim standby yielded (another standby already promoted for this handoff)" \
+            > /dev/null 2>&1 || true
+
+      - name: Record promotion time
+        id: promote_start
+        if: steps.wait.outputs.promoted == '1' && steps.claim.outputs.won == '1'
+        run: |
+          echo "start_epoch=$(date +%s)" >> "$GITHUB_OUTPUT"
+
+      - name: Activate (promoted -- becomes the new active session)
+        if: steps.wait.outputs.promoted == '1' && steps.claim.outputs.won == '1'
+        env:
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+          SHIM_ROOT: /home/runner/shim
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          MIAPORTAL_BASE_URL: ${{ vars.MIAPORTAL_BASE_URL }}
+          ACTIVATION_REASON: warm-handoff
+        run: |
+          # Consume the go-file so a stale copy can't cause a second,
+          # bogus promotion later (e.g. if this repo state were ever
+          # re-pulled without a fresh go-file present).
+          rm -f /home/runner/shim/repo/vps-shim/state/go_standby.json
+          bash /home/runner/shim/repo/vps-shim/scripts/activate.sh
+
+      - name: Sync loop within budget (now the active session)
+        if: steps.wait.outputs.promoted == '1' && steps.claim.outputs.won == '1'
+        env:
+          START_EPOCH: ${{ steps.promote_start.outputs.start_epoch }}
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          RUNNER_REPO_NAME: ${{ env.RUNNER_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+          SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
+          SHIM_OWNER_CHAT_ID: ${{ secrets.SHIM_OWNER_CHAT_ID }}
+        run: |
+          bash /home/runner/shim/repo/vps-shim/scripts/sync_loop.sh
+
+      - name: Final checkpoint push (always, including on cancellation)
+        if: always()
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          bash /home/runner/shim/repo/vps-shim/scripts/git_push.sh "checkpoint: final (workflow always-run step)" || true

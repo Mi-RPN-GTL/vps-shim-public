@@ -368,6 +368,16 @@ jobs:
           BOOT_STAGE="setup_env_done" BOOT_ROLE="session" python3 /tmp/write_boot_progress.py || true
           python3 /home/runner/shim/repo/vps-shim/telegram/handoff_diag.py boot --when boot >/dev/null 2>&1 || true
 
+      - name: Sentinel gate (hold while another session is genuinely alive)
+        env:
+          GH_OWNER: ${{ github.repository_owner }}
+          PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
+          SHIM_PAT: ${{ secrets.SHIM_PAT }}
+        run: |
+          touch /tmp/sentinel_holding
+          python3 /home/runner/shim/repo/vps-shim/telegram/sentinel.py wait || echo "sentinel error -- proceeding"
+          rm -f /tmp/sentinel_holding
+
       - name: Activate (launch bot/webui/tunnel, resume processes)
         env:
           SHIM_BOT_TOKEN: ${{ secrets.SHIM_BOT_TOKEN }}
@@ -401,6 +411,7 @@ jobs:
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
         run: |
+          if [ -f /tmp/sentinel_holding ]; then echo "sentinel never activated -- skipping"; exit 0; fi
           # v221: guarded existence check -- a run that never got past
           # an early step (e.g. cancelled during Free disk space, before
           # Setup environment ever clones the repo) has nothing at
@@ -428,6 +439,7 @@ jobs:
           PRIVATE_REPO_NAME: ${{ vars.PRIVATE_REPO_NAME }}
           SHIM_PAT: ${{ secrets.SHIM_PAT }}
         run: |
+          if [ -f /tmp/sentinel_holding ]; then echo "sentinel never activated -- skipping"; exit 0; fi
           # v222 (watchdog removed entirely -- self-respawn replaces it):
           # this step is the whole mechanism. `if: always()` steps are
           # explicitly granted a real grace window during cancellation --
@@ -646,6 +658,10 @@ jobs:
             python3 -c "import sys; sys.path.insert(0, '/home/runner/shim/repo/vps-shim/telegram'); import commit_now, os; commit_now.write_role_heartbeat(os.environ['GH_OWNER'], os.environ['PRIVATE_REPO_NAME'], os.environ['SHIM_PAT'], 'standby')" || true
           }
           _standby_hb
+          mkdir -p /home/runner/shim/repo/vps-shim/logs
+          SHIM_ROOT=/home/runner/shim timeout 1500 python3 /home/runner/shim/repo/vps-shim/scripts/home_sync.py --restore >> /home/runner/shim/repo/vps-shim/logs/home_sync.log 2>&1 || echo "pre-restore incomplete -- activate.sh will fall back to its own restore"
+          _standby_hb
+          SHIM_ROOT=/home/runner/shim nohup python3 /home/runner/shim/repo/vps-shim/scripts/home_sync.py --follow >> /home/runner/shim/repo/vps-shim/logs/home_sync.log 2>&1 &
           while true; do
             if [ -f "$GO_FILE" ]; then
               # A go-file older than this standby's start is left over from a previous cycle -- ignore it.
@@ -762,6 +778,8 @@ jobs:
                         if rec is None:
                             continue
                         if launched.is_alive(rec['pid']) and launched.is_paused(rec['pid']):
+                            import subprocess as _sp
+                            _sp.run(['python3', '/home/runner/shim/repo/vps-shim/scripts/home_sync.py', '--catchup'], timeout=1000, check=False, env=dict(__import__('os').environ, SHIM_ROOT='/home/runner/shim'))
                             resumed_ok = launched.resume(standby_id)
                             print(f'PHASE: resumed swapped-in replica (launch_id {standby_id}, for outgoing {outgoing_id}), ok={resumed_ok}')
                             import handoff_diag as _hd
